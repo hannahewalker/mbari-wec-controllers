@@ -1,0 +1,7 @@
+/controller:
+  ros__parameters:
+    torque_constant: 0.438
+    quad_coeff: 4.4e-07 # N-m per RPM^2
+    torque_max: 16.6 	# N-m, saturation (same as tables breakpoint)
+    
+
