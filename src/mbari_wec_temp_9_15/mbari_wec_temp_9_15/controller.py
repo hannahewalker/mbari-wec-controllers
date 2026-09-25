@@ -13,22 +13,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import threading
 
 from buoy_api import Interface
-import rclpy
 import numpy as np
+import rclpy
 from scipy import interpolate
+
+from .run_log import RunLog
+
 
 class ControlPolicy(object):
 
     def __init__(self):
-        # Define any parameter variables here
-        self.Torque_constant = 0.438 # N-m/amps
-        # Desired damping torque vs rpm relationship 
-        #self.foo = 1.0
+        self.Torque_constant = 0.438  # N-m/amps
+        # Desired damping torque vs rpm relationship
         self.N_Spec = np.array([0.0, 300.0, 600.0, 1000.0, 1700.0, 4400.0, 6790.0])  # RPM
         self.Torque_Spec = np.array([0.0, 0.0, 0.8, 2.9, 5.6, 9.8, 16.6])  # N-m
-
         self.update_params()
 
     def update_params(self):
@@ -42,16 +43,16 @@ class ControlPolicy(object):
     def target(self, rpm, scale_factor, retract_factor):
         """Calculate target value from feedback inputs."""
         N = abs(rpm)
-        I = self.windcurr_interp1d(N)
+        current = self.windcurr_interp1d(N)
 
         # Apply damping gain
-        I *= scale_factor
+        current *= scale_factor
 
         # Hysteresis due to gravity / wave assist
         if rpm > 0.0:
-            I *= -retract_factor
+            current *= -retract_factor
 
-        return float(I)
+        return float(current)
 
     def __str__(self):
         return """ControlPolicy:
@@ -62,11 +63,13 @@ class ControlPolicy(object):
                             nspec=self.N_Spec,
                             tspec=self.Torque_Spec,
                             ispec=self.I_Spec)
-    
+
+
 class Controller(Interface):
 
     def __init__(self):
         super().__init__('controller')
+        self.use_sim_time()   # run timers on /clock (output folder is still named by wall clock)
 
         self.policy = ControlPolicy()
         self.set_params()
@@ -74,32 +77,20 @@ class Controller(Interface):
         # set packet rates from controllers here
         # controller defaults to publishing @ 10Hz
         # call these to set rate to 50Hz or provide argument for specific rate
-        self.set_pc_pack_rate(blocking=False)  # set PC publish rate to 50Hz
-        # self.set_sc_pack_rate(blocking=False)  # set SC publish rate to 50Hz
+        # self.set_pc_pack_rate(blocking=False)  # set PC publish rate to 50Hz
+        # --- wave prediction logging ---
+        self.lead_times = [0.0, 2.0, 5.0, 10.0]   # seconds into the future
+        self.sim_t = None
+        self.buoy_z = None
+        self.pending = []   # (target_time, lead, predicted_eta)
+        self.pending_lock = threading.Lock()   # timer and latent_callback run concurrently
 
-        # Use this to set node clock to use sim time from /clock (from gazebo sim time)
-        # Access node clock via self.get_clock() or other various
-        # time-related functions of rclpy.Node
-        # self.use_sim_time()
+        # output goes into the sim's pblog run folder (same pbloghome as the sim launch arg)
+        self.declare_parameter('pbloghome', '~/.pblogs')
+        self.run_log = RunLog(self, self.get_parameter('pbloghome').value,
+                              run_info={'lead_times_s': self.lead_times})
 
-    # To subscribe to any topic, simply define the specific callback, e.g. power_callback
-    # def power_callback(self, data):
-    #     """Enables feedback of '/power_data' topic from Power Controller"""
-    #     # get target value from control policy
-    #     target_value = self.policy.target(data.rpm, data.scale, data.retract)
-
-    #     # send a command, e.g. winding current
-    #     self.send_pc_wind_curr_command(target_value, blocking=False)
-
-    # Available commands to send within any callback:
-    # self.send_pump_command(duration_mins, blocking=False)
-    # self.send_valve_command(duration_sec, blocking=False)
-    # self.send_pc_wind_curr_command(wind_curr_amps, blocking=False)
-    # self.send_pc_bias_curr_command(bias_curr_amps, blocking=False)
-    # self.send_pc_scale_command(scale_factor, blocking=False)
-    # self.send_pc_retract_command(retract_factor, blocking=False)
-
-    # Delete any unused callback
+        self.create_timer(1.0, self.predict_timer)   # ask for a new prediction every 1 s
 
     def ahrs_callback(self, data):
         """Provide feedback of '/ahrs_data' topic from XBowAHRS."""
@@ -143,10 +134,21 @@ class Controller(Interface):
         pass  # remove if there's anything to do above
 
     def latent_callback(self, data):
-        """Provide feedback of '/latent_data' topic -- SIM ONLY values (e.g. losses, wave data)."""
-        # Potentially evaluate controller performance against sim only (latent data NOT AVAILABLE
-        # in physical buoy)
-        pass  # remove if there's anything to do above
+        # current sim time and buoy vertical position
+        self.sim_t = data.header.stamp.sec + data.header.stamp.nanosec * 1e-9
+        self.buoy_z = data.wave_body.pose.position.z
+
+        # any predictions whose target time has now arrived?
+        with self.pending_lock:
+            still_waiting = []
+            for t_target, lead, eta in self.pending:
+                if self.sim_t >= t_target:
+                    print(f't={t_target:8.2f}  lead={lead:5.1f}s  '
+                          f'pred={eta:7.3f} m  buoy z={self.buoy_z:7.3f} m')
+                    self.run_log.log_prediction(t_target, lead, eta, self.buoy_z, self.sim_t)
+                else:
+                    still_waiting.append((t_target, lead, eta))
+            self.pending = still_waiting
 
     def set_params(self):
         """Use ROS2 declare_parameter and get_parameter to set policy params."""
@@ -166,11 +168,32 @@ class Controller(Interface):
         self.policy.update_params()
         self.get_logger().info(str(self.policy))
 
+    def predict_timer(self):
+        """Request predicted wave heights at the buoy."""
+        if self.sim_t is None:
+            return   # no latent data yet
+        n = len(self.lead_times)
+        resp = self.get_inc_wave_height(
+            x=[0.0] * n, y=[0.0] * n, t=self.lead_times,
+            use_buoy_origin=True,     # (0, 0) = at the buoy
+            use_relative_time=True,   # t = seconds from now
+            timeout=0.5)
+        if resp is None or resp.result.value != resp.result.OK:
+            return
+        with self.pending_lock:
+            for h in resp.heights:
+                stamp = h.pose.header.stamp.sec + h.pose.header.stamp.nanosec * 1e-9
+                t_target = stamp + h.relative_time
+                self.pending.append((t_target, h.relative_time, h.pose.pose.position.z))
+
 
 def main():
     rclpy.init()
     controller = Controller()
-    controller.spin()
+    try:
+        controller.spin()   # note: buoy_api's spin() calls sys.exit() when done
+    finally:
+        controller.run_log.close()
     rclpy.shutdown()
 
 
