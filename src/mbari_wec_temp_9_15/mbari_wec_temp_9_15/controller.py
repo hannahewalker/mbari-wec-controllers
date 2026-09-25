@@ -184,7 +184,8 @@ class Controller(Interface):
             for h in resp.heights:
                 stamp = h.pose.header.stamp.sec + h.pose.header.stamp.nanosec * 1e-9
                 t_target = stamp + h.relative_time
-                self.pending.append((t_target, h.relative_time, h.pose.pose.position.z))
+                lead = round(h.relative_time, 3)   # sim echoes it back with float noise
+                self.pending.append((t_target, lead, h.pose.pose.position.z))
 
 
 def main():
