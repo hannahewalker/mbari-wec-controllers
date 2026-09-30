@@ -71,7 +71,7 @@ class RollingStats:
         return self.span() >= fraction * self.window_s
 
     def stats(self):
-        """Mean, std. min, max over every sample currently in the window"""
+        """Mean, std, rms, min, max over every sample currently in the window"""
         n = len(self._x)
         if n == 0:
             return None
@@ -81,6 +81,7 @@ class RollingStats:
             'n': n,
             'mean': mean,
             'std': math.sqrt(var),
+            'rms': math.sqrt(sum(v * v for v in self._x) / n),
             'min': min(self._x),
             'max': max(self._x),
             'span': self.span(),
@@ -97,7 +98,7 @@ class StatsRecorder:
     latest      - the snapshot from the last update(); format() and write_row() use it.
     """
 
-    FIELDS = ('mean', 'std', 'min', 'max', 'n')
+    FIELDS = ('mean', 'std', 'rms', 'min', 'max', 'n')
 
     def __init__(self, signals, window_s, csv_path=None, extra_fields=()):
         self.signals = list(signals)
@@ -153,7 +154,7 @@ class StatsRecorder:
             s = self.latest.get(name)
             if s:
                 parts.append(
-                    f"{name}: mean={s['mean']:.3g} std={s['std']:.3g} "
+                    f"{name}: mean={s['mean']:.3g} std={s['std']:.3g} rms={s['rms']:.3g} "
                     f"min={s['min']:.3g} max={s['max']:.3g}"
                     f"(n={s['n']}, {s['span']:.1f}s)")
         return ' | '.join(parts) if parts else 'no data yet'
