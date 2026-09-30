@@ -14,8 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import threading
+import math 
+import os
 
 from buoy_api import Interface
+from .rollingstats import StatsRecorder, SeaStateEstimator, stamp_to_sec
 import numpy as np
 import rclpy
 from scipy import interpolate
@@ -70,7 +73,6 @@ class Controller(Interface):
     def __init__(self):
         super().__init__('controller')
         self.use_sim_time()   # run timers on /clock (output folder is still named by wall clock)
-
         self.policy = ControlPolicy()
         self.set_params()
 
@@ -79,7 +81,7 @@ class Controller(Interface):
         # call these to set rate to 50Hz or provide argument for specific rate
         # self.set_pc_pack_rate(blocking=False)  # set PC publish rate to 50Hz
         # --- wave prediction logging ---
-        self.lead_times = [0.0, 2.0, 5.0, 10.0]   # seconds into the future
+        self.lead_times = [5.0]   # seconds into the future
         self.sim_t = None
         self.buoy_z = None
         self.pending = []   # (target_time, lead, predicted_eta)
@@ -91,12 +93,31 @@ class Controller(Interface):
                               run_info={'lead_times_s': self.lead_times})
 
         self.create_timer(1.0, self.predict_timer)   # ask for a new prediction every 1 s
+        self.pbloghome = self.get_parameter('pbloghome').value
+
+        self.stats = StatsRecorder(
+            ['piston_pos', 'piston_vel', 'elec_power', 'mech_power', 'rpm',
+             'end_stop_margin', 'force'],
+            self.wec_window_s,
+            extra_fields=['Hs', 'Tp', 'steepness'])
+
+        
+        self.sea_state_offsets = [0.0, 0.25, 0.5, 0.75]
+        self.sea_state = SeaStateEstimator(window_s=self.sea_state_window_s, fs=4.0)
+
+        self._prev_pos = None  # (t, x) for piston velocity
+        self.stats_timer = self.create_timer(self.stats_update_period_s,
+                                             self.update_stats)
+
+
 
     def ahrs_callback(self, data):
         """Provide feedback of '/ahrs_data' topic from XBowAHRS."""
-        # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        # ROLLING STATS: buoy vertical acceleration -> sea-state estimate
+        #t = stamp_to_sec(data.header.stamp)
+        #self.sea_state.add(t, vertical_accel(data.imu))
+        pass
+
 
     def battery_callback(self, data):
         """Provide feedback of '/battery_data' topic from Battery Controller."""
@@ -106,13 +127,34 @@ class Controller(Interface):
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
-        # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        # ROLLING STATS: piston position, velocity, end-stop margin, force
+        t = stamp_to_sec(data.header.stamp)
+        x = data.range_finder
+        self.stats.add('piston_pos', t, x)
+ 
+        if self._prev_pos is not None and t > self._prev_pos[0]:
+            v = (x - self._prev_pos[1]) / (t - self._prev_pos[0])
+            self.stats.add('piston_vel', t, v)
+        self._prev_pos = (t, x)
+ 
+        margin = min(x - self.stroke_min, self.stroke_max - x)
+        self.stats.add('end_stop_margin', t, margin)
+        self.stats.add('force', t, data.load_cell)
+ 
+        # safety check on every sample, not once per second
+        if margin < self.end_stop_warn_margin:
+            self.get_logger().warn(f'Piston {margin:.3f} from end stop',
+                                   throttle_duration_sec=1.0)
+
 
     def power_callback(self, data):
         """Provide feedback of '/power_data' topic from Power Controller."""
         # Update class variables, get control policy target, send commands, etc.
+        t = stamp_to_sec(data.header.stamp)
+        self.stats.add('rpm',t,data.rpm)
+        self.stats.add('mech_power',t,data.torque*data.rpm*2*math.pi / 60)
+        self.stats.add('elec_power', t, data.voltage * data.bcurrent)
+
         wind_curr = self.policy.target(data.rpm, data.scale, data.retract)
 
         self.get_logger().info('WindingCurrent:' +
@@ -150,6 +192,21 @@ class Controller(Interface):
                     still_waiting.append((t_target, lead, eta))
             self.pending = still_waiting
 
+    def update_stats(self):
+        self.stats.update()
+        ss = self.sea_state.estimate()
+        self.get_logger().info(self.stats.format())
+        self.get_logger().info(self.sea_state.format())
+
+        # open the CSV in the sim's run folder once data is flowing (same rule as RunLog)
+        if not self.stats.csv_is_open() and self.stats.latest_t is not None:
+            link = os.path.join(os.path.expanduser(self.pbloghome), 'latest_csv_dir')
+            run_dir = os.path.realpath(link)
+            if os.path.isdir(run_dir):
+                self.stats.open_csv(os.path.join(run_dir, 'rolling_stats.csv'))
+
+        self.stats.write_row(extra=ss)
+
     def set_params(self):
         """Use ROS2 declare_parameter and get_parameter to set policy params."""
         self.declare_parameter('torque_constant', self.policy.Torque_constant)
@@ -163,18 +220,36 @@ class Controller(Interface):
         self.declare_parameter('torque_spec', self.policy.Torque_Spec.tolist())
         self.policy.Torque_Spec = \
             np.array(self.get_parameter('torque_spec').get_parameter_value().double_array_value)
-
+        
         # recompute any dependent variables
         self.policy.update_params()
         self.get_logger().info(str(self.policy))
+
+
+        # ROLLING STATS parameters (override in the params YAML)
+        stats_params = {
+            'wec_window_s': 25.0,          # WEC-state window (20-30 s)
+            'sea_state_window_s': 300.0,   # Hs/Tp window
+            'stats_update_period_s': 1.0,
+            'stats_csv_path': '',          # empty = no CSV
+            'stroke_min': 0.0,             # DOUBLE CHECK
+            'stroke_max': 75.0,            # DOUBLE CHECK
+            'end_stop_warn_margin': 0.1,
+        }
+        for name, default in stats_params.items():
+            self.declare_parameter(name, default)
+            setattr(self, name, self.get_parameter(name).value)
+
+
 
     def predict_timer(self):
         """Request predicted wave heights at the buoy."""
         if self.sim_t is None:
             return   # no latent data yet
-        n = len(self.lead_times)
+        t_rel = sorted(set(self.lead_times) | set(self.sea_state_offsets))
+        n = len(t_rel)
         resp = self.get_inc_wave_height(
-            x=[0.0] * n, y=[0.0] * n, t=self.lead_times,
+            x=[0.0] * n, y=[0.0] * n, t=t_rel,
             use_buoy_origin=True,     # (0, 0) = at the buoy
             use_relative_time=True,   # t = seconds from now
             timeout=0.5)
@@ -185,7 +260,11 @@ class Controller(Interface):
                 stamp = h.pose.header.stamp.sec + h.pose.header.stamp.nanosec * 1e-9
                 t_target = stamp + h.relative_time
                 lead = round(h.relative_time, 3)   # sim echoes it back with float noise
-                self.pending.append((t_target, lead, h.pose.pose.position.z))
+                eta = h.pose.pose.position.z
+                if lead in self.lead_times:
+                    self.pending.append((t_target, lead, eta))
+                if lead in self.sea_state_offsets:
+                    self.sea_state.add(t_target, eta)
 
 
 def main():
