@@ -13,9 +13,10 @@ In the controller, pass the message header stamp (stamp_to_sec(data.header.stamp
 so windows follow simulated time.
 """
 
-from collections import deque 
+from collections import deque
 import csv
-import math 
+import math
+import threading
 import numpy as np
 
 def stamp_to_sec(stamp):
@@ -107,6 +108,7 @@ class StatsRecorder:
         self.latest_t = None
         self.latest = {}
         self.latest_update_t = None
+        self._lock = threading.Lock()
         self._csv_file = None
         self._writer = None
         if csv_path:
@@ -124,29 +126,31 @@ class StatsRecorder:
         return self._writer is not None
 
     def add(self, name, t, x):
-        w = self.windows[name]
-        last = w.last_time()
-        if last is not None and t < last:
-            # this signal's time went backwards: the sim restarted, so reset everything
-            for other in self.windows.values():
-                other.clear()
-            self.latest_t = None
-        w.add(t,x)
-        if self.latest_t is None or t > self.latest_t:
-            self.latest_t = t
+        with self._lock:
+            w = self.windows[name]
+            last = w.last_time()
+            if last is not None and t < last:
+                # this signal's time went backwards: the sim restarted, so reset everything
+                for other in self.windows.values():
+                    other.clear()
+                self.latest_t = None
+            w.add(t, x)
+            if self.latest_t is None or t > self.latest_t:
+                self.latest_t = t
 
     def __getitem__(self,name):
         return self.windows[name]
 
     def update(self):
-        """Algin all windows to the newest sample time and snapshot their stats."""
-        if self.latest_t is None:
+        """Align all windows to the newest sample time and snapshot their stats."""
+        with self._lock:
+            if self.latest_t is None:
+                return self.latest
+            for w in self.windows.values():
+                w.trim(self.latest_t)
+            self.latest = {name: w.stats() for name, w in self.windows.items()}
+            self.latest_update_t = self.latest_t
             return self.latest
-        for w in self.windows.values():
-            w.trim(self.latest_t)
-        self.latest = {name: w.stats() for name, w in self.windows.items()}
-        self.latest_update_t = self.latest_t
-        return self.latest
 
     def format(self):
         parts = []
@@ -197,23 +201,26 @@ class SeaStateEstimator:
         self.f_min = f_min
         self.f_max = f_max
         self.latest = None
+        self._lock = threading.Lock()
 
     def add(self, t, eta):
-        last = self.window.last_time()
-        if last is not None and t <= last:
-            if t < last - 10.0:
-                self.window.clear()   # large jump back: sim restarted
-            else:
-                return                # duplicate or out-of-order sample: skip it
-        self.window.add(t, eta)
+        with self._lock:
+            last = self.window.last_time()
+            if last is not None and t <= last:
+                if t < last - 10.0:
+                    self.window.clear()   # large jump back: sim restarted
+                else:
+                    return                # duplicate or out-of-order sample: skip it
+            self.window.add(t, eta)
 
     def is_full(self, fraction=0.95):
         return self.window.is_full(fraction)
 
     def estimate(self):
         """Returns {'Hs', 'Tp', 'steepness'}, or None until 2 segments of data exist."""
-        t = np.array(self.window._t)
-        eta = np.array(self.window._x)
+        with self._lock:
+            t = np.array(self.window._t)
+            eta = np.array(self.window._x)
         if len(t) < 4 or t[-1] - t[0] < 2 * self.segment_s:
             self.latest = None
             return None

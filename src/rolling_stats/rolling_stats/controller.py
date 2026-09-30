@@ -274,6 +274,7 @@ def main():
         controller.spin()   # note: buoy_api's spin() calls sys.exit() when done
     finally:
         controller.run_log.close()
+        controller.stats.close()
     rclpy.shutdown()
 
 
