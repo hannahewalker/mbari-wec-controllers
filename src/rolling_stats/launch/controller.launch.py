@@ -16,27 +16,40 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch_ros.actions import Node
 
 
 package_name = 'rolling_stats'
 
+# launch args that override controller.yaml when given, e.g.
+#   ros2 launch rolling_stats controller.launch.py scale_factor:=1.2 retract_factor:=0.8
+OVERRIDES = {'scale_factor': float, 'retract_factor': float, 'pbloghome': str}
 
-def generate_launch_description():
-    ld = LaunchDescription()
+
+def launch_node(context):
     config = os.path.join(
         get_package_share_directory(package_name),
         'config',
         'controller.yaml'
         )
+    overrides = {name: convert(context.launch_configurations[name])
+                 for name, convert in OVERRIDES.items() if context.launch_configurations[name]}
 
     node = Node(
         package=package_name,
         name='controller',
         executable='controller',
-        parameters=[config]
+        parameters=[config, overrides]
     )
+    return [node]
 
-    ld.add_action(node)
+
+def generate_launch_description():
+    ld = LaunchDescription()
+    for name in OVERRIDES:
+        ld.add_action(DeclareLaunchArgument(
+            name, default_value='', description=f'{name} (default: value in controller.yaml)'))
+    ld.add_action(OpaqueFunction(function=launch_node))
 
     return ld

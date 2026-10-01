@@ -75,6 +75,7 @@ class Controller(Interface):
         self.use_sim_time()   # run timers on /clock (output folder is still named by wall clock)
         self.policy = ControlPolicy()
         self.set_params()
+        self.pc_factors_sent = False   # scale/retract sent to the power controller yet?
 
         # set packet rates from controllers here
         # controller defaults to publishing @ 10Hz
@@ -150,15 +151,24 @@ class Controller(Interface):
     def power_callback(self, data):
         """Provide feedback of '/power_data' topic from Power Controller."""
         # Update class variables, get control policy target, send commands, etc.
+        # also set the factors on the power controller, so its default damping matches if our
+        # commands stop (sim_pblog leaves its PC Scale / PC Retract columns empty).
+        # Done on the first message rather than at startup: the sim may not be up yet then.
+        if not self.pc_factors_sent:
+            self.send_pc_scale_command(self.scale_factor, blocking=False)
+            self.send_pc_retract_command(self.retract_factor, blocking=False)
+            self.pc_factors_sent = True
+
         t = stamp_to_sec(data.header.stamp)
         self.stats.add('rpm',t,data.rpm)
         self.stats.add('mech_power',t,data.torque*data.rpm*2*math.pi / 60)
         self.stats.add('elec_power', t, data.voltage * data.bcurrent)
 
-        wind_curr = self.policy.target(data.rpm, data.scale, data.retract)
+        wind_curr = self.policy.target(data.rpm, self.scale_factor, self.retract_factor)
 
         self.get_logger().info('WindingCurrent:' +
-                               f' f({data.rpm:.02f}, {data.scale:.02f}, {data.retract:.02f})' +
+                               f' f({data.rpm:.02f}, {self.scale_factor:.02f},'
+                               f' {self.retract_factor:.02f})' +
                                f' = {wind_curr:.02f}')
 
         self.send_pc_wind_curr_command(wind_curr, blocking=False)
@@ -199,6 +209,7 @@ class Controller(Interface):
         self.get_logger().info(self.sea_state.format())
 
         # open the CSV in the sim's run folder once data is flowing (same rule as RunLog)
+
         if not self.stats.csv_is_open() and self.stats.latest_t is not None:
             link = os.path.join(os.path.expanduser(self.pbloghome), 'latest_csv_dir')
             run_dir = os.path.realpath(link)
@@ -224,6 +235,19 @@ class Controller(Interface):
         # recompute any dependent variables
         self.policy.update_params()
         self.get_logger().info(str(self.policy))
+
+        # damping gain and extra retract-direction gain applied in power_callback.
+        # The sim ignores its own scale/retract while we command winding current, so these
+        # (not data.scale / data.retract) set the damping. Ranges match the sim's PC services.
+        for name, default, lo, hi in (('scale_factor', 1.0, 0.5, 1.4),
+                                      ('retract_factor', 0.6, 0.4, 1.0)):
+            self.declare_parameter(name, default)
+            value = float(self.get_parameter(name).value)
+            if not lo <= value <= hi:
+                raise ValueError(f'{name}={value} outside the valid range [{lo}, {hi}]')
+            setattr(self, name, value)
+        self.get_logger().info(f'scale_factor: {self.scale_factor}  '
+                               f'retract_factor: {self.retract_factor}')
 
 
         # ROLLING STATS parameters (override in the params YAML)
