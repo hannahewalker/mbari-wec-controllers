@@ -167,6 +167,12 @@ def main():
                         help='write the per-run sim yamls and list the runs, but run nothing')
     args = parser.parse_args()
 
+    # both workspaces must be sourced, or every run fails at launch
+    for pkg, ws in (('buoy_gazebo', '~/mbari_wec_ws'), ('rolling_stats', '~/controller_ws')):
+        if subprocess.run(['ros2', 'pkg', 'prefix', pkg], capture_output=True).returncode:
+            sys.exit(f"ROS can't find the {pkg} package. Run this first:\n"
+                     f'    source {ws}/install/setup.bash')
+
     with open(args.sweep_yaml) as f:
         sim_params = yaml.safe_load(f)
 
@@ -227,4 +233,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:   # run_one has already stopped the sim and controller
+        sys.exit('\nStopped. Finished runs are listed in sweep_runs.csv')

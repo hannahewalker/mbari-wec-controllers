@@ -13,8 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import threading
-import math 
+import math
 import os
 
 from buoy_api import Interface
@@ -81,20 +80,13 @@ class Controller(Interface):
         # controller defaults to publishing @ 10Hz
         # call these to set rate to 50Hz or provide argument for specific rate
         # self.set_pc_pack_rate(blocking=False)  # set PC publish rate to 50Hz
-        # --- wave prediction logging ---
-        self.lead_times = [5.0]   # seconds into the future
-        self.sim_t = None
-        self.buoy_z = None
-        self.pending = []   # (target_time, lead, predicted_eta)
-        self.pending_lock = threading.Lock()   # timer and latent_callback run concurrently
+        self.sim_t = None   # set by latent_callback; wave heights are requested once it is
 
         # output goes into the sim's pblog run folder (same pbloghome as the sim launch arg)
         self.declare_parameter('pbloghome', '~/.pblogs')
-        self.run_log = RunLog(self, self.get_parameter('pbloghome').value,
-                              run_info={'lead_times_s': self.lead_times})
+        self.run_log = RunLog(self, self.get_parameter('pbloghome').value)
 
-        self.create_timer(1.0, self.predict_timer)   # ask for a new prediction every 1 s
-        self.pbloghome = self.get_parameter('pbloghome').value
+        self.create_timer(1.0, self.wave_height_timer)   # sea-state samples every 1 s
 
         self.stats = StatsRecorder(
             ['piston_pos', 'piston_vel', 'elec_power', 'mech_power', 'rpm',
@@ -102,7 +94,8 @@ class Controller(Interface):
             self.wec_window_s,
             extra_fields=['Hs', 'Tp', 'steepness'])
 
-        
+
+        # incident wave height at the buoy, 0-0.75 s ahead: 4 samples/s for the estimator
         self.sea_state_offsets = [0.0, 0.25, 0.5, 0.75]
         self.sea_state = SeaStateEstimator(window_s=self.sea_state_window_s, fs=4.0)
 
@@ -186,21 +179,8 @@ class Controller(Interface):
         pass  # remove if there's anything to do above
 
     def latent_callback(self, data):
-        # current sim time and buoy vertical position
-        self.sim_t = data.header.stamp.sec + data.header.stamp.nanosec * 1e-9
-        self.buoy_z = data.wave_body.pose.position.z
-
-        # any predictions whose target time has now arrived?
-        with self.pending_lock:
-            still_waiting = []
-            for t_target, lead, eta in self.pending:
-                if self.sim_t >= t_target:
-                    print(f't={t_target:8.2f}  lead={lead:5.1f}s  '
-                          f'pred={eta:7.3f} m  buoy z={self.buoy_z:7.3f} m')
-                    self.run_log.log_prediction(t_target, lead, eta, self.buoy_z, self.sim_t)
-                else:
-                    still_waiting.append((t_target, lead, eta))
-            self.pending = still_waiting
+        """Sim-only '/latent_data': note the sim time, so wave heights can be requested."""
+        self.sim_t = stamp_to_sec(data.header.stamp)
 
     def update_stats(self):
         self.stats.update()
@@ -208,13 +188,11 @@ class Controller(Interface):
         self.get_logger().info(self.stats.format())
         self.get_logger().info(self.sea_state.format())
 
-        # open the CSV in the sim's run folder once data is flowing (same rule as RunLog)
-
-        if not self.stats.csv_is_open() and self.stats.latest_t is not None:
-            link = os.path.join(os.path.expanduser(self.pbloghome), 'latest_csv_dir')
-            run_dir = os.path.realpath(link)
-            if os.path.isdir(run_dir):
-                self.stats.open_csv(os.path.join(run_dir, 'rolling_stats.csv'))
+        # open the CSV in RunLog's run folder once data is flowing; RunLog only uses a folder
+        # whose sim pblog is being written now, so an old run's file is never overwritten
+        if (not self.stats.csv_is_open() and self.stats.latest_t is not None
+                and self.run_log.ensure_started()):
+            self.stats.open_csv(os.path.join(self.run_log.run_dir, 'rolling_stats.csv'))
 
         self.stats.write_row(extra=ss)
 
@@ -268,29 +246,21 @@ class Controller(Interface):
 
 
 
-    def predict_timer(self):
-        """Request predicted wave heights at the buoy."""
+    def wave_height_timer(self):
+        """Feed the sea-state estimator incident wave heights at the buoy."""
         if self.sim_t is None:
             return   # no latent data yet
-        t_rel = sorted(set(self.lead_times) | set(self.sea_state_offsets))
-        n = len(t_rel)
+        n = len(self.sea_state_offsets)
         resp = self.get_inc_wave_height(
-            x=[0.0] * n, y=[0.0] * n, t=t_rel,
+            x=[0.0] * n, y=[0.0] * n, t=self.sea_state_offsets,
             use_buoy_origin=True,     # (0, 0) = at the buoy
             use_relative_time=True,   # t = seconds from now
             timeout=0.5)
         if resp is None or resp.result.value != resp.result.OK:
             return
-        with self.pending_lock:
-            for h in resp.heights:
-                stamp = h.pose.header.stamp.sec + h.pose.header.stamp.nanosec * 1e-9
-                t_target = stamp + h.relative_time
-                lead = round(h.relative_time, 3)   # sim echoes it back with float noise
-                eta = h.pose.pose.position.z
-                if lead in self.lead_times:
-                    self.pending.append((t_target, lead, eta))
-                if lead in self.sea_state_offsets:
-                    self.sea_state.add(t_target, eta)
+        for h in resp.heights:
+            t = stamp_to_sec(h.pose.header.stamp) + h.relative_time
+            self.sea_state.add(t, h.pose.pose.position.z)
 
 
 def main():
@@ -299,7 +269,6 @@ def main():
     try:
         controller.spin()   # note: buoy_api's spin() calls sys.exit() when done
     finally:
-        controller.run_log.close()
         controller.stats.close()
     rclpy.shutdown()
 

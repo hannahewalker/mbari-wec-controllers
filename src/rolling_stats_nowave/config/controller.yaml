@@ -1,0 +1,8 @@
+/controller:
+  ros__parameters:
+    torque_constant: 0.438
+    n_spec: [0.0, 300.0, 600.0, 1000.0, 1700.0, 4400.0, 6790.0]
+    torque_spec: [0.0, 0.0, 0.8, 2.9, 5.6, 9.8, 16.6]
+    scale_factor: 1.0     # damping gain, 0.5 - 1.4
+    retract_factor: 0.6   # extra gain in the retract direction, 0.4 - 1.0
+
