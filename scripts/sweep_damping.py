@@ -1,6 +1,10 @@
-"""Run one sim per (wave, scale_factor, retract_factor) combination with the rolling_stats controller.
+"""Run one sim per (wave, scale_factor, retract_factor) combination with a rolling-stats controller.
 
-usage: sweep_damping.py sweep.yaml [--out DIR] [--no-rosbag] [--dry-run]
+usage: sweep_damping.py sweep.yaml [--package PKG] [--out DIR] [--no-rosbag] [--dry-run]
+
+--package picks the controller: rolling_stats (default) or rolling_stats_nowave (no
+wave-prediction logging). Its controller.launch.py must take scale_factor, retract_factor
+and pbloghome launch arguments.
 
 sweep.yaml is a normal mbari_wec_batch sim_params_yaml, plus arrays of damping factors:
 
@@ -25,10 +29,11 @@ runner's nested folders so each run is one folder:
 
     <out>/sweep_<time>/
         sweep.yaml
-        sweep_runs.csv                         -- run, factors, wave, status (ok/FAILED), folder
+        sweep_runs.csv                         -- run, factors, wave, status (ok/FAILED), folder,
+                                                  controller package
         run00_s0.80_r0.60_A0.5_T8/
             <sim pblog>.csv, latest
-            rolling_stats.csv, wave_pred.csv, controller_params.yaml
+            rolling_stats.csv, controller_params.yaml, wave_pred.csv (rolling_stats only)
             controller.log, sim.log, sim.yaml, batch_runs.log
             rosbag2/                           -- unless --no-rosbag
 """
@@ -108,7 +113,7 @@ def wait_until_ready(proc, log_path):
     return False
 
 
-def run_one(run_dir, sim_yaml, scale, retract, rosbag):
+def run_one(run_dir, sim_yaml, scale, retract, rosbag, package):
     """Controller first, then the sim, in run_dir/_batch; returns the sim's return code."""
     work = os.path.join(run_dir, '_batch')   # batch runner's nested output goes here
     os.makedirs(work)
@@ -118,7 +123,7 @@ def run_one(run_dir, sim_yaml, scale, retract, rosbag):
     try:
         with open(os.path.join(run_dir, 'controller.log'), 'w') as ctl_log:
             ctl = subprocess.Popen(
-                ['ros2', 'launch', 'rolling_stats', 'controller.launch.py',
+                ['ros2', 'launch', package, 'controller.launch.py',
                  f'scale_factor:={scale}', f'retract_factor:={retract}',
                  f'pbloghome:={pbloghome}'],
                 cwd=work, stdout=ctl_log, stderr=subprocess.STDOUT,
@@ -159,6 +164,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('sweep_yaml')
+    parser.add_argument('--package', default='rolling_stats',
+                        help='controller package to run (default: %(default)s;'
+                             ' or rolling_stats_nowave)')
     parser.add_argument('--out', default='~/.pblogs/sweeps',
                         help='parent folder for the sweep (default: %(default)s)')
     parser.add_argument('--no-rosbag', action='store_true',
@@ -168,7 +176,7 @@ def main():
     args = parser.parse_args()
 
     # both workspaces must be sourced, or every run fails at launch
-    for pkg, ws in (('buoy_gazebo', '~/mbari_wec_ws'), ('rolling_stats', '~/controller_ws')):
+    for pkg, ws in (('buoy_gazebo', '~/mbari_wec_ws'), (args.package, '~/controller_ws')):
         if subprocess.run(['ros2', 'pkg', 'prefix', pkg], capture_output=True).returncode:
             sys.exit(f"ROS can't find the {pkg} package. Run this first:\n"
                      f'    source {ws}/install/setup.bash')
@@ -184,7 +192,7 @@ def main():
             sys.exit(f'{name} values {bad} outside the valid range [{lo}, {hi}]')
         factors[name] = values
     if sim_params.pop('controller', None) is not None:
-        print('Ignoring the controller entry in the yaml: this script runs rolling_stats')
+        print(f'Ignoring the controller entry in the yaml: this script runs {args.package}')
     waves = split_waves(sim_params.pop('IncidentWaveSpectrumType', None))
     multi = [k for k, v in sim_params.items() if isinstance(v, list) and len(v) > 1]
     if multi:
@@ -197,12 +205,13 @@ def main():
     os.makedirs(sweep_dir)
     shutil.copy(args.sweep_yaml, os.path.join(sweep_dir, 'sweep.yaml'))
     print(f'{len(waves)} waves x {len(runs) // len(waves)} damping combos'
-          f' = {len(runs)} runs -> {sweep_dir}')
+          f' = {len(runs)} runs with {args.package} -> {sweep_dir}')
 
     index_path = os.path.join(sweep_dir, 'sweep_runs.csv')
     with open(index_path, 'w', newline='', buffering=1) as index_file:
         index = csv.writer(index_file)
-        index.writerow(['run', 'scale_factor', 'retract_factor', 'wave', 'status', 'folder'])
+        index.writerow(['run', 'scale_factor', 'retract_factor', 'wave', 'status', 'folder',
+                        'controller'])
         for i, ((wave, wave_params), scale, retract) in enumerate(runs):
             name = f'run{i:02d}_s{scale:.2f}_r{retract:.2f}_{wave}'
             run_dir = os.path.join(sweep_dir, name)
@@ -219,7 +228,7 @@ def main():
             if args.dry_run:
                 continue
             t0 = time.time()
-            run_one(run_dir, sim_yaml, scale, retract, not args.no_rosbag)
+            run_one(run_dir, sim_yaml, scale, retract, not args.no_rosbag, args.package)
             # ros2 launch exits 0 even when the sim dies, so check for the output instead
             missing = [f for f in ('latest', 'rolling_stats.csv')   # latest -> sim pblog CSV
                        if not os.path.exists(os.path.join(run_dir, f))]
@@ -227,7 +236,7 @@ def main():
             print(f'  {status} after {time.time() - t0:.0f} s'
                   + (f': no {" or ".join(missing)}; see sim.log / controller.log'
                      if missing else ''))
-            index.writerow([i, scale, retract, wave, status, name])
+            index.writerow([i, scale, retract, wave, status, name, args.package])
 
     print(f'Done. Index of runs: {index_path}')
 
