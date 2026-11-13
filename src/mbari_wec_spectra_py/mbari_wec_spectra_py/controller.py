@@ -75,6 +75,20 @@ class ControlPolicy(object):
                             tspec=self.Torque_Spec,
                             ispec=self.I_Spec)
 
+def bulk_params(f, S):
+    # Hm0, Tp (parabolic sub-bin peak), Te from PSD
+    m0 = np.trapezoid(S, f)
+    m_1 = np.trapezoid(S / f, f)
+    ip = int(np.argmax(S))
+    fp = f[ip]
+    if 0 < ip < len(f) - 1:
+        y0, y1, y2 = S[ip-1:ip+2]
+        denom = y0 - 2*y1 + y2
+        if denom != 0:
+            fp += 0.5 * (y0 - y2) / denom * (f[1] - f[0])
+
+    return {'Hm0': 4.0 * np.sqrt(m0), 'Tp': 1.0 / fp, 'Te': m_1 / m0}
+
 
 class Controller(Interface):
 
@@ -88,7 +102,7 @@ class Controller(Interface):
         self.plot_data = None
         self.input_Tp = 12.0      # what you launched the sim with, for reference
 
-        # Transfer Function Hardcode
+        # RPM: Transfer Function Hardcode 
         '''
         self.H_f = np.array([0.035, 0.04, 0.045, 0.05, 0.055, 0.06, 0.065, 0.07, 0.075, 0.08, 
                              0.085, 0.09, 0.095, 0.1, 0.105, 0.11, 0.115, 0.12, 0.125, 0.13, 
@@ -121,7 +135,7 @@ class Controller(Interface):
                              0.4000, 0.4050, 0.4100, 0.4150, 0.4200, 0.4250, 0.4300, 0.4350,
                              0.4400, 0.4450, 0.4500, 0.4550, 0.4600, 0.4650, 0.4700, 0.4750,
                              0.4800, 0.4850, 0.4900, 0.4950, 0.5000])
-        self.H_mag  = 0.9*np.array([4.6274, 4.6274, 4.5756, 3.9168, 2.4184, 1.8757, 1.4871, 1.0248,
+        self.H2  = 0.9*np.array([4.6274, 4.6274, 4.5756, 3.9168, 2.4184, 1.8757, 1.4871, 1.0248,
                              0.96545, 1.0709, 1.085, 0.99164, 0.7714, 0.86036, 0.93251, 1.0043,
                              1.0767, 1.1491, 1.2222, 1.2981, 1.3792, 1.4672, 1.5647, 1.674,
                              1.794, 1.9241, 2.0627, 2.2054, 2.3468, 2.4842, 2.616, 2.7401,
@@ -133,6 +147,7 @@ class Controller(Interface):
                              1.5404, 1.4355, 1.3338, 1.2355, 1.1416, 1.0537, 0.97305, 0.89955,
                              0.83339, 0.77478, 0.72369, 0.67994, 0.64335, 0.6136, 0.59031, 0.57267,
                              0.55973, 0.5507, 0.54468, 0.54081, 0.53848])
+        self.rpm_scale = 1 / 2500.0     # must match rpmScale in the MATLAB sim analysis
         
         # Rolling window info 
         #self.window_sec = 400.0
@@ -140,6 +155,36 @@ class Controller(Interface):
         self.seg_sec = 128.0
         self.window_sec = 3 * self.seg_sec + 10.0    # a little extra so all 5 segments fit
         self.x_buf = deque()
+
+        # Rangefinder: TF Hardcode
+        self.range_scale = 1/0.254
+        self.H_f_range = np.array([0.0400, 0.0450, 0.0500, 0.0550, 0.0600, 0.0650, 0.0700, 0.0750,
+                             0.0800, 0.0850, 0.0900, 0.0950, 0.1000, 0.1050, 0.1100, 0.1150,
+                             0.1200, 0.1250, 0.1300, 0.1350, 0.1400, 0.1450, 0.1500, 0.1550,
+                             0.1600, 0.1650, 0.1700, 0.1750, 0.1800, 0.1850, 0.1900, 0.1950,
+                             0.2000, 0.2050, 0.2100, 0.2150, 0.2200, 0.2250, 0.2300, 0.2350,
+                             0.2400, 0.2450, 0.2500, 0.2550, 0.2600, 0.2650, 0.2700, 0.2750,
+                             0.2800, 0.2850, 0.2900, 0.2950, 0.3000, 0.3050, 0.3100, 0.3150,
+                             0.3200, 0.3250, 0.3300, 0.3350, 0.3400, 0.3450, 0.3500, 0.3550,
+                             0.3600, 0.3650, 0.3700, 0.3750, 0.3800, 0.3850, 0.3900, 0.3950,
+                             0.4000, 0.4050, 0.4100, 0.4150, 0.4200, 0.4250, 0.4300, 0.4350,
+                             0.4400, 0.4450, 0.4500, 0.4550, 0.4600, 0.4650, 0.4700, 0.4750,
+                             0.4800, 0.4850, 0.4900, 0.4950, 0.5000])
+        self.H2_range = np.array([3.835, 3.835, 3.2021, 1.5535, 1.2718, 1.1753, 1.0337, 0.66846,
+                             0.65729, 0.95, 0.99792, 0.79236, 0.56907, 0.64873, 0.69727, 0.74455,
+                             0.79242, 0.84096, 0.89155, 0.94631, 1.007, 1.0758, 1.1552, 1.2466,
+                             1.3497, 1.4638, 1.5877, 1.7178, 1.8506, 1.9846, 2.1182, 2.2505,
+                             2.3833, 2.5195, 2.6645, 2.8223, 2.9964, 3.1892, 3.3964, 3.611,
+                             3.8208, 4.0123, 4.1718, 4.2943, 4.3758, 4.4184, 4.4249, 4.4041,
+                             4.364, 4.3108, 4.2529, 4.1923, 4.1271, 4.0541, 3.9703, 3.8721,
+                             3.7581, 3.6302, 3.4873, 3.3356, 3.1815, 3.0285, 2.88, 2.7345,
+                             2.5921, 2.4531, 2.3169, 2.182, 2.0491, 1.9193, 1.794, 1.6748,
+                             1.563, 1.4584, 1.3609, 1.2715, 1.1904, 1.1172, 1.0518, 0.99276,
+                             0.93948, 0.89167, 0.8492, 0.81236, 0.78118, 0.75548, 0.7352, 0.71989,
+                             0.70883, 0.70116, 0.69608, 0.69293, 0.69109])
+        self.tr_buf = deque()
+        self.xr_buf = deque()
+
         self.lock = threading.Lock()
         self.create_timer(5.0, self.compute_spectrum)
 
@@ -160,157 +205,120 @@ class Controller(Interface):
                 self.t_buf.popleft()
                 self.x_buf.popleft()
 
- 
-    def compute_spectrum(self):
-        # take a consistent snapshot of the window
+    def spring_callback(self,data):
+        # Provide feedback of '/spring_data' topic from Spring Controller
+        t = data.header.stamp.sec + data.header.stamp.nanosec * 1e-9
         with self.lock:
-            t = np.array(self.t_buf)
-            x = np.array(self.x_buf)
+            self.tr_buf.append(t)
+            self.xr_buf.append(data.range_finder)
+            while self.tr_buf[-1] - self.tr_buf[0] > self.window_sec:
+                self.tr_buf.popleft()
+                self.xr_buf.popleft()
 
-        # if the window isn't full yet, return
-        if len(t) < 2:
-            self.get_logger().info('no data yet')
-            return
+    def spectrum(self, t, x, kind):
+        # Same processing for both signals; None until the window is full
+        if len(t) < 2 or (t[-1] - t[0]) < self.window_sec - 5.0:
+            return None
 
-        span = t[-1] - t[0]
-        self.get_logger().info(f'{len(t)} samples, span {span:.1f} s')
+        fs = 10.0
+        tu = np.arange(t[0], t[-1], 1.0 / fs)
+        xu = np.interp(tu, t, x)
 
-        if span < 0.95 * self.window_sec:
-            return
-
-        # resample to a uniform time grid
-        t = np.array(self.t_buf)
-        x = np.array(self.x_buf)
-
-        fs = 10.0                                   # resample rate, Hz
-        t_uniform = np.arange(t[0], t[-1], 1.0 / fs)
-        x_uniform = np.interp(t_uniform, t, x)
-        x0 = x_uniform - np.mean(x_uniform)
-
-        # FFT / Welch -> frequencies and PSD
-        dt = np.diff(t)
-        #f, S = signal.welch(x_uniform, fs=fs, window='hann',
-        #            nperseg=int(100 * fs), noverlap=int(50 * fs),
-        #            detrend='linear', scaling='density')
         nseg = int(self.seg_sec * fs)
-        f, S = signal.welch(x_uniform, fs=fs, window='hann',
-                            nperseg=nseg, noverlap=3 * nseg // 4,
-                            detrend='linear', scaling='density')
-        var_time = np.var(x0)
-        var_spec = np.trapezoid(S, f)
-        peak_f = f[np.argmax(S[1:]) + 1]   # skip 0 Hz
+        f, S = signal.welch(xu, fs=fs, window='hann', nperseg=nseg,
+                            noverlap=3 * nseg // 4, detrend='linear', scaling='density')
 
-        # restrict to the wave band (also avoids dividing by f = 0)
-        band = (f >= 0.03) & (f <= 0.5)
+        band = (f >= 0.04) & (f <= 0.5)
         fb = f[band]
 
-        S_vel = 0.0254**2 * S[band] / 60.0**2                   # rpm to m approx
-        S_disp = S_vel / (2 * np.pi * fb)**2
-        
-        m0  = np.trapezoid(S_disp, fb)
-        m_1 = np.trapezoid(S_disp / fb, fb)        # m_{-1}
-        Te  = m_1 / m0
-        Tp  = 1.0 / fb[np.argmax(S_disp)]
+        if kind == 'rpm':        # velocity -> displacement
+            S_disp = S[band] * self.rpm_scale**2 / (2 * np.pi * fb)**2
+            H2 = np.interp(fb, self.H_f, self.H2)
+        else:                    # range is already a position
+            S_disp = S[band] * self.range_scale**2
+            H2 = np.interp(fb, self.H_f_range, self.H2_range)
 
+        S_eta = S_disp / np.maximum(H2, 1e-6)
 
-        # APPLY TRANSFER FUNCTION
-        H = np.interp(fb, self.H_f, self.H_mag)
-        H = np.maximum(H, 1e-3)
-        S_eta = S_disp / H
-        S_eta_s = uniform_filter1d(S_eta, size=3, mode='nearest')
+        # 3-bin band average
+        S_disp = uniform_filter1d(S_disp, size=3, mode='nearest')
+        S_eta = uniform_filter1d(S_eta, size=3, mode='nearest')
 
-        m0_eta = np.trapezoid(S_eta_s, fb)
-        m_1_eta = np.trapezoid(S_eta_s / fb, fb)
-        Te_eta = m_1_eta / m0_eta
-        Tp_eta = 1.0 / fb[np.argmax(S_eta_s)]
-        Hm0_eta = 4.0 * np.sqrt(m0_eta)
+        return {'t': tu, 'x': xu - np.mean(xu), 'f': fb,
+                'S': S_disp, 'S_eta': S_eta,
+                'raw': bulk_params(fb, S_disp), 'est': bulk_params(fb, S_eta)}
 
-        #self.get_logger().info(f'Tp {Tp:.1f} s, Te {Te:.1f} s, m0 {m0:.1f}')
-        #self.get_logger().info(f'Tp_eta {Tp_eta:.1f} s, Te_eta {Te_eta:.1f} s, m0_eta {m0_eta:.1f}')
-        self.get_logger().info(f'rpm2dist: Tp {Tp:.1f} s, Te {Te:.1f} s, Hm0 {4*np.sqrt(m0):.3f} m')
-        self.get_logger().info(f'wave est: Tp {Tp_eta:.1f} s, Te {Te_eta:.1f} s, Hm0 {Hm0_eta:.2f} m')
-        
-        #self.plot_data = (t_uniform, x_uniform - np.mean(x_uniform), fb, S_disp, Tp, Te)
-        self.plot_data = (t_uniform, x_uniform - np.mean(x_uniform), fb, S_disp, Tp, Te,
-                          S_eta, Tp_eta, Te_eta, Hm0_eta)
-        pass
+    def compute_spectrum(self):
+        with self.lock:
+            t_p, x_p = np.array(self.t_buf), np.array(self.x_buf)
+            t_r, x_r = np.array(self.tr_buf), np.array(self.xr_buf)
 
-    def update_plot(self, t, x, f, S, Tp, Te, S_eta, Tp_eta, Te_eta, Hm0_eta):
+        self.get_logger().info(
+            f'rpm span {t_p[-1]-t_p[0] if len(t_p) > 1 else 0:.0f} s, '
+            f'range span {t_r[-1]-t_r[0] if len(t_r) > 1 else 0:.0f} s')
+
+        res = {'rpm': self.spectrum(t_p, x_p, 'rpm'),
+               'range': self.spectrum(t_r, x_r, 'range')}
+        if res['rpm'] is None or res['range'] is None:
+            return
+
+        for name, r in res.items():
+            a, b = r['raw'], r['est']
+            self.get_logger().info(
+                f'{name:5s} raw: Hm0 {a["Hm0"]:.2f}, Tp {a["Tp"]:.1f}, Te {a["Te"]:.1f} | '
+                f'TF: Hm0 {b["Hm0"]:.2f} m, Tp {b["Tp"]:.1f} s, Te {b["Te"]:.1f} s')
+
+        self.plot_data = (res['rpm'], res['range'])
+
+    def update_plot(self, r_rpm, r_rng):
+        results = (r_rpm, r_rng)
+        names = ('rpm', 'range finder')
+
         if self.fig is None:
             plt.ion()
-            self.fig, (self.ax_t, self.ax_f, self.ax_w) = plt.subplots(3, 1, figsize=(8, 9))
+            self.fig, self.axs = plt.subplots(3, 2, figsize=(12, 10))
+            self.lines = {}
+            for c, name in enumerate(names):
+                ax_t, ax_f, ax_w = self.axs[:, c]
 
-            # time series
-            self.line_t, = self.ax_t.plot([], [])
-            self.ax_t.set_xlabel('time in window (s)')
-            self.ax_t.set_ylabel('rpm (mean removed)')
+                self.lines[(c, 't')], = ax_t.plot([], [], color=f'C{c}')
+                ax_t.set_xlabel('time in window (s)')
+                ax_t.set_ylabel(name)
 
-            # displacement spectrum
-            self.line_f, = self.ax_f.semilogy([], [], label='displacement PSD')
-            self.vline_Tp = self.ax_f.axvline(0, color='r', ls='--', label='measured Tp')
-            self.ax_f.axvline(1 / self.input_Tp, color='k', ls=':', label='input Tp')
-            self.ax_f.set_ylabel('PSD (rev²/Hz)')
-            self.ax_f.legend(loc='upper right')
+                self.lines[(c, 'f')], = ax_f.semilogy([], [], color=f'C{c}')
+                ax_f.set_ylabel('raw displacement PSD')
 
-            # transfer-function-corrected wave spectrum
-            self.line_w, = self.ax_w.semilogy([], [], color='C2', label='wave est. (S_disp/|H|²)')
-            self.vline_Tp_w = self.ax_w.axvline(0, color='r', ls='--', label='est. Tp')
-            self.ax_w.axvline(1 / self.input_Tp, color='k', ls=':', label='input Tp')
-            self.ax_w.set_xlabel('frequency (Hz)')
-            self.ax_w.set_ylabel('PSD (m²/Hz)')
-            self.ax_w.legend(loc='upper right')
+                self.lines[(c, 'w')], = ax_w.semilogy([], [], color='C2')
+                ax_w.set_ylabel('wave PSD (m²/Hz)')
+                ax_w.set_xlabel('frequency (Hz)')
 
-            for ax in (self.ax_f, self.ax_w):
-                ax.set_xlim(0, 0.5)
+                for ax in (ax_f, ax_w):
+                    ax.axvline(1 / self.input_Tp, color='k', ls=':', label='input Tp')
+                    ax.set_xlim(0, 0.5)
+                    ax.grid(True, which='both', alpha=0.3)
+                    ax.legend(loc='upper right', fontsize=8)
             self.fig.tight_layout()
 
-        self.line_t.set_data(t - t[0], x)
-        self.line_f.set_data(f, S)
-        self.line_w.set_data(f, S_eta)
-        self.vline_Tp.set_xdata([1 / Tp, 1 / Tp])
-        self.vline_Tp_w.set_xdata([1 / Tp_eta, 1 / Tp_eta])
+        for c, (r, name) in enumerate(zip(results, names)):
+            ax_t, ax_f, ax_w = self.axs[:, c]
+            self.lines[(c, 't')].set_data(r['t'] - r['t'][0], r['x'])
+            self.lines[(c, 'f')].set_data(r['f'], r['S'])
+            self.lines[(c, 'w')].set_data(r['f'], r['S_eta'])
 
-        for ax in (self.ax_t, self.ax_f, self.ax_w):
-            ax.relim()
-            ax.autoscale_view()
-        for ax in (self.ax_f, self.ax_w):
-            ax.set_xlim(0, 0.5)
+            for ax in (ax_t, ax_f, ax_w):
+                ax.relim()
+                ax.autoscale_view()
+            for ax in (ax_f, ax_w):
+                ax.set_xlim(0, 0.5)
 
-        self.ax_t.set_title(f'window ending t = {t[-1]:.1f} s')
-        self.ax_f.set_title(f'displacement: Tp {Tp:.1f} s, Te {Te:.1f} s', fontsize=10)
-        self.ax_w.set_title(f'wave est.: Hm0 {Hm0_eta:.2f} m, Tp {Tp_eta:.1f} s, Te {Te_eta:.1f} s',
-                            fontsize=10)
+            a, b = r['raw'], r['est']
+            ax_t.set_title(f'{name}: window ending t = {r["t"][-1]:.1f} s', fontsize=10)
+            ax_f.set_title(f'raw: Hm0 {a["Hm0"]:.2f}, Tp {a["Tp"]:.1f} s, Te {a["Te"]:.1f} s',
+                           fontsize=9)
+            ax_w.set_title(f'TF: Hm0 {b["Hm0"]:.2f} m, Tp {b["Tp"]:.1f} s, Te {b["Te"]:.1f} s',
+                           fontsize=9)
+
         self.fig.canvas.draw_idle()
-    # def update_plot(self, t, x, f, S, Tp, Te):
-    #     if self.fig is None:
-    #         plt.ion()
-    #         self.fig, (self.ax_t, self.ax_f) = plt.subplots(2, 1, figsize=(8, 6))
-
-    #         self.line_t, = self.ax_t.plot([], [])
-    #         self.ax_t.set_xlabel('time in window (s)')
-    #         self.ax_t.set_ylabel('rpm (mean removed)')
-
-    #         self.line_f, = self.ax_f.semilogy([], [], label='displacement PSD')
-    #         self.vline_Tp = self.ax_f.axvline(0, color='r', ls='--', label='measured Tp')
-    #         self.ax_f.axvline(1 / self.input_Tp, color='k', ls=':', label='input Tp')
-    #         self.ax_f.set_xlabel('frequency (Hz)')
-    #         self.ax_f.set_ylabel('PSD (rev²/Hz)')
-    #         self.ax_f.set_xlim(0, 0.5)
-    #         self.ax_f.legend(loc='upper right')
-    #         self.fig.tight_layout()
-
-    #     self.line_t.set_data(t - t[0], x)
-    #     self.line_f.set_data(f, S)
-    #     self.vline_Tp.set_xdata([1 / Tp, 1 / Tp])
-
-    #     for ax in (self.ax_t, self.ax_f):
-    #         ax.relim()
-    #         ax.autoscale_view()
-    #     self.ax_f.set_xlim(0, 0.5)
-
-    #     self.ax_t.set_title(f'window ending t = {t[-1]:.1f} s   |   Tp {Tp:.1f} s, Te {Te:.1f} s')
-    #     self.fig.canvas.draw_idle()
-    #     plt.pause(0.001)
 
     def set_params(self):
         """Use ROS2 declare_parameter and get_parameter to set policy params."""
